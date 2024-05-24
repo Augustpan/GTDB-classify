@@ -3,7 +3,7 @@
 @author: Augustpan
 @email: yfpan21@m.fudan.edu.cn
 @tel: 135****9152
-@datetime: 2024/5/24 12:11
+@datetime: 2024/5/24 16:40
 @project: GTDB-classify
 @file: taxonomy_assignment.py
 @desc: taxonomy assignment tool for bacterial and archaeal marker genes.
@@ -13,10 +13,12 @@ import Bio
 from Bio import Phylo
 import numpy as np
 import pandas as pd
-
+import sys
+import json
 from multiprocessing import Pool
 from functools import partial
 from copy import deepcopy
+from tqdm import tqdm
 
 def calculate_red(tree):
     # Cache for storing precomputed distances
@@ -169,22 +171,39 @@ def is_nested(tree, clades_a, clades_b):
     mrca_b = tree.common_ancestor(clades_b)
     return mrca_a.is_parent_of(mrca_b)
 
-
 if __name__ == "__main__":
-    # Load the tree from a Newick file
-    tree = Phylo.read("input_tree.nwk", "newick")
-    print("Tree loaded.")
 
-    #tree.root_at_midpoint()
-    #print("Mid-point-rooted.")
+    #####################################################
+    tree_file = "test-large.nwk"
+    redtree_file = "test-large-with-red.nwk"
+    taxonomy_file = "bac120_taxonomy_r214_reps.tsv"
+    monophyletic_clades_file = "monophyletic_clades.json"
+    red_file = "red.json"
+    load_monophyletic_clades_from_file = False
+    do_mid_point_root = False
+    nproc = 72
+    ######################################################
+
+    # Load the tree from a Newick file
+    tree = Phylo.read(tree_file, "newick")
+    print("Tree loaded.", file=sys.stderr)
+
+    do_mid_point_root = False
+    if do_mid_point_root:
+        tree.root_at_midpoint()
+        print("Mid-point-rooted.", file=sys.stderr)
+    else:
+        print("Skip mid-point-rooting.", file=sys.stderr)
 
     # Calculate RED values
     calculate_red(tree)
-    print("RED calculation finished.")
+    print("RED calculation finished.", file=sys.stderr)
 
-    #tax_table = load_taxonomy("ar53_taxonomy_r214_reps.tsv")
-    tax_table = load_taxonomy("bac120_taxonomy_r214_reps.tsv")
-    print("Taxonomy loaded.")
+    if redtree_file:
+        write_tree_with_red(tree, redtree_file)
+
+    tax_table = load_taxonomy(taxonomy_file)
+    print("Taxonomy loaded.", file=sys.stderr)
 
     tip_labels = [node.name for node in tree.find_clades(terminal = True)]
     tax_table_sub = tax_table[tax_table.genome_acc.isin(tip_labels)]
@@ -197,6 +216,10 @@ if __name__ == "__main__":
     node_list_ref = list(tree_ref.find_clades(terminal = True))
     node_name_ref = [node.name for node in node_list_ref]
     node_df_ref = pd.DataFrame({"node":node_list_ref, "genome_acc":node_name_ref})
+
+    node_list_tree = list(tree.find_clades(terminal = True))
+    node_name_tree = [node.name for node in node_list_tree]
+    node_df = pd.DataFrame({"node":node_list_tree, "genome_acc":node_name_tree})
 
     def worker(taxon, rank):
         df = tax_table_sub[tax_table_sub[rank] == taxon]
@@ -217,58 +240,85 @@ if __name__ == "__main__":
         return is_mono, num_taxa, taxon, mrca
 
     rank_names = ["domain", "phylum", "class", "order", "family", "genus", "species"]
-    monophyletic_clades = {rank: [] for rank in rank_names}
 
-    red_table = {rank: [] for rank in rank_names}
-    with Pool(processes=12) as pool:
-        for rank in rank_names:
-            print(f"Assessing monophyleticity: {rank}")
-            results = pool.map(partial(worker, rank=rank), set(tax_table_sub[rank]))
-            for is_mono, num_taxa, taxon, mrca in results:
-                if is_mono and num_taxa > 1:
-                    red_table[rank].append(mrca.red)
-                    monophyletic_clades[rank].append(taxon)
+    if load_monophyletic_clades_from_file:
+        with open(monophyletic_clades_file) as f:
+            monophyletic_clades = json.load(f)
+        with open(red_file) as f:
+            red_table = json.load(f)
+        print("Monophyleticity file loaded.", file=sys.stderr)
+    else:
+        monophyletic_clades = {rank: [] for rank in rank_names}
+        red_table = {rank: [] for rank in rank_names}
+        with Pool(processes=nproc) as pool:
+            for rank in rank_names:
+                print(f"Assessing monophyleticity: {rank}", file=sys.stderr)
+                results = pool.map(partial(worker, rank=rank), set(tax_table_sub[rank]))
+                for is_mono, num_taxa, taxon, mrca in results:
+                    if is_mono and num_taxa > 1:
+                        red_table[rank].append(mrca.red)
+                        monophyletic_clades[rank].append(taxon)
+        with open(monophyletic_clades_file, "w") as f:
+            json.dump(monophyletic_clades, f)
+        with open(red_file, "w") as f:
+            json.dump(red_table, f)
 
-    print(f"# Reference RED stat:")
-    for rank in red_table:
-        q75, q25 = np.percentile(red_table[rank], [75 ,25])
-        print(f"{rank}\t{np.median(red_table[rank])}\t{q75}\t{q25}")
+        print("Monophyleticity check done.", file=sys.stderr)
+        print(f"# Reference RED stat:")
+        for rank in red_table:
+            if red_table[rank]:
+                q75, q50, q25 = np.percentile(red_table[rank], [75, 50, 25])
+            else:
+                q75, q50, q25 = np.nan, np.nan, np.nan
+            print(f"{rank}\t{q50}\t{q75}\t{q25}")
 
+    print("Building MRCA map.", file=sys.stderr)
+    mrca_map = {}
+    for rank in monophyletic_clades:
+        for taxon in monophyletic_clades[rank]:
+            selected_taxa = list(tax_table_sub[tax_table_sub[rank] == taxon].genome_acc)
+            node_list = list(node_df[node_df.genome_acc.isin(selected_taxa)].node)
+            mrca = tree.common_ancestor(node_list)
+            mrca_map[taxon] = mrca
+
+    print("Start Taxonomy assignments.", file=sys.stderr)
     print("# Taxonomy assignments.")
-    for node in tree.find_clades(terminal = True):
-        if node.name not in query_names:
-            continue
-
+    i = 0
+    for name in tqdm(query_names):
+        i += 1
+        node = tree.find_any(name)
         taxon_assigned = False
         cloest_ref, dist = tree_search_dijkstra(tree, node, lambda x: x.is_terminal() and x.name in reference_names)
         ranks = list(tax_table_sub[tax_table_sub.genome_acc == cloest_ref.name].iloc[0,1:8])
         for rank, taxon in reversed(list(zip(rank_names, ranks))):
             if taxon in monophyletic_clades[rank]:
-                tree_tmp = deepcopy(tree)
-
-                selected_taxa = list(tax_table_sub[tax_table_sub[rank] == taxon].genome_acc)
-                selected_taxa.append(node.name)
-                node_list = [x for x in tree_tmp.find_clades(terminal = True) if x.name in selected_taxa]
-
-                for name in query_names:
-                    if name != node.name:
-                        tree_tmp.prune(name)
-
-                if tree_tmp.is_monophyletic(node_list):
-                    selected_taxa = list(tax_table_sub[tax_table_sub[rank] == taxon].genome_acc)
-                    clades_a = [x for x in tree_tmp.find_clades(terminal = True) if x.name in selected_taxa]
-                    clades_b = list(tree_tmp.find_clades(terminal = True, name = node.name))
-                    if is_nested(tree_tmp, clades_a, clades_b):
+                if mrca_map:
+                    mrca = mrca_map[taxon]
+                    if mrca.is_parent_of(node):
                         print(f"{node.name}\t{rank}\t{taxon}")
                         taxon_assigned = True
                         break
+                else:
+                    selected_taxa = list(tax_table_sub[tax_table_sub[rank] == taxon].genome_acc)
+                    clades_a = list(node_df[node_df.genome_acc.isin(selected_taxa)].node)
+                    clades_b = [node]
+                    if is_nested(tree, clades_a, clades_b):
+                        print(f"{node.name}\t{rank}\t{taxon}")
+                        taxon_assigned = True
+                        break
+
         if not taxon_assigned:
             print(f"{node.name}\t\t")
 
+    print("Start RED assignment.", file=sys.stderr)
     print("# RED value for MRCA of pairs of queries")
-    for node in tree.find_clades(terminal = True):
-        if node.name not in query_names:
-            continue
-        cloest_ref, dist = tree_search_dijkstra(tree, node, lambda x: x.is_terminal() and x.name in query_names and x.name != node.name)
-        mrca = tree.common_ancestor([node, cloest_ref])
-        print(f"{node.name}\t{cloest_ref.name}\t{mrca.red}")
+    for name in tqdm(query_names):
+        node = tree.find_any(name)
+
+        cloest_node, dist = tree_search_dijkstra(tree, node, lambda x: x.is_terminal() and x.name != node.name)
+        mrca = tree.common_ancestor([node, cloest_node])
+
+        cloest_ref, dist = tree_search_dijkstra(tree, node, lambda x: x.is_terminal() and x.name in reference_names)
+        mrca_ref = tree.common_ancestor([node, cloest_ref])
+
+        print(f"{node.name}\t{cloest_ref.name}\t{mrca_ref.red}\t{cloest_node.name}\t{mrca.red}")
